@@ -11,6 +11,9 @@ import com.bank.credit.model.enums.CreditType;
 import com.bank.credit.model.enums.CustomerType;
 import com.bank.credit.repository.CreditRepository;
 import java.math.BigDecimal;
+import java.time.LocalDateTime;
+import java.util.UUID;
+
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -29,6 +32,7 @@ public class CreditService {
     private final CreditRepository creditRepository;
     private final CreditMapper creditMapper;
     private final CustomerClient customerClient;
+    private final KafkaProducerService kafkaProducerService;
 
     /**
      * Create a new credit with business rule validations
@@ -43,7 +47,20 @@ public class CreditService {
                 .flatMap(customer -> validateBusinessRules(request, customer))
                 .map(creditMapper::toEntity)
                 .flatMap(creditRepository::save)
-                .doOnSuccess(credit -> log.info("Credit created successfully: {}", credit.getCreditNumber()))
+                .flatMap(credit -> {
+                    // Publicar evento después de guardar exitosamente
+                    EntityActionEvent event = EntityActionEvent.builder()
+                            .eventId(UUID.randomUUID().toString())
+                            .eventType("CREDIT_CREATED")
+                            .entityType(credit.getClass().getSimpleName())
+                            .payload(credit)
+                            .timestamp(LocalDateTime.now())
+                            .build();
+                    return kafkaProducerService.sendEvent(credit.getId(), event)
+                            .doOnSuccess(msg -> log.info("Credit created successfully: {}", credit.getCreditNumber()))
+                            .doOnError(e -> log.error("Error publishing event: {}", e.getMessage()))
+                            .thenReturn(credit);
+                })
                 .map(creditMapper::toResponse);
     }
 
@@ -250,7 +267,20 @@ public class CreditService {
                     creditMapper.updateEntity(existingCredit, request);
                     return creditRepository.save(existingCredit);
                 })
-                .doOnSuccess(credit -> log.info("Credit updated successfully with id: {}", id))
+                .flatMap(credit -> {
+                    // Publicar evento después de actualizar exitosamente
+                    EntityActionEvent event = EntityActionEvent.builder()
+                            .eventId(UUID.randomUUID().toString())
+                            .eventType("CREDIT_UPDATED")
+                            .entityType(credit.getClass().getSimpleName())
+                            .timestamp(LocalDateTime.now())
+                            .payload(credit)
+                            .build();
+                    return kafkaProducerService.sendEvent(credit.getId(), event)
+                            .doOnSuccess(v -> log.info("Credit updated successfully with id: {}", id))
+                            .doOnError(e -> log.error("Error publishing event: {}", e.getMessage()))
+                            .thenReturn(credit);
+                })
                 .map(creditMapper::toResponse);
     }
 
@@ -265,6 +295,18 @@ public class CreditService {
         return creditRepository.findById(id)
                 .switchIfEmpty(Mono.error(new CreditNotFoundException(id)))
                 .flatMap(credit -> creditRepository.deleteById(id)
-                        .doOnSuccess(v -> log.info("Credit deleted successfully with id: {}", id)));
+                        .then(Mono.defer(() -> {
+                            // Publicar evento después de eliminar exitosamente
+                            EntityActionEvent event = EntityActionEvent.builder()
+                                    .eventId(UUID.randomUUID().toString())
+                                    .eventType("CREDIT_DELETED")
+                                    .entityType(credit.getClass().getSimpleName())
+                                    .timestamp(LocalDateTime.now())
+                                    .payload(credit)
+                                    .build();
+                            return kafkaProducerService.sendEvent(id, event)
+                                    .doOnSuccess(v -> log.info("Credit deleted successfully with id: {}", id))
+                                    .doOnError(e -> log.error("Error publishing event: {}", e.getMessage()));
+                        })));
     }
 }
